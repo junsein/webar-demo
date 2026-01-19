@@ -37,7 +37,9 @@ async function startCamera() {
     btnStart.disabled = true;
     btnStop.disabled = false;
 
-    setStatus("拖拉木頭進圈內並保持穩定");
+    startFireTask(); // ✅ 相機開啟後才生成木柴/營火
+
+    setStatus("拖拉木柴進圈內並保持穩定");
   } catch (err) {
     console.error(err);
     stream = null;
@@ -58,6 +60,8 @@ function stopCamera() {
   btnStart.disabled = false;
   btnStop.disabled = true;
 
+  // 停止時清掉所有 3D 物件
+  resetAllTasks();
   setStatus("相機已關閉");
 }
 
@@ -96,11 +100,12 @@ resize();
 
 // ---------------- Game State ----------------
 const GameState = Object.freeze({
+  IDLE: "IDLE",
   FIRE: "FIRE",
   HUNT: "HUNT",
   DONE: "DONE",
 });
-let state = GameState.FIRE;
+let state = GameState.IDLE;
 
 // ---------------- Shared Raycaster ----------------
 const raycaster = new THREE.Raycaster();
@@ -113,23 +118,35 @@ function setPointer(event) {
 
 // ============================================================
 // 1) FIRE TASK (drag woods into circle)
+//    - 相機開啟後才生成
+//    - 完成後全部移除
 // ============================================================
 const fireRadius = 0.6;
 const STABLE_SECONDS_FIRE = 2.5;
 
-const fireCircle = new THREE.Mesh(
-  new THREE.RingGeometry(fireRadius - 0.02, fireRadius, 32),
-  new THREE.MeshBasicMaterial({
-    color: 0xffaa33,
-    transparent: true,
-    opacity: 0.85,
-  })
-);
-fireCircle.rotation.x = -Math.PI / 2;
-fireCircle.position.set(0, -0.6, 0);
-scene.add(fireCircle);
+let fireCircle = null;
+let woods = [];
+let flame = null;
 
-const woods = [];
+let draggingWood = null;
+const firePlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0.6); // y = -0.6
+let fired = false;
+let stableTimeFire = 0;
+
+function createFireCircle() {
+  const m = new THREE.Mesh(
+    new THREE.RingGeometry(fireRadius - 0.02, fireRadius, 32),
+    new THREE.MeshBasicMaterial({
+      color: 0xffaa33,
+      transparent: true,
+      opacity: 0.85,
+    })
+  );
+  m.rotation.x = -Math.PI / 2;
+  m.position.set(0, -0.6, 0);
+  return m;
+}
+
 function createWood(x, z, rotY = 0) {
   const mesh = new THREE.Mesh(
     new THREE.BoxGeometry(0.25, 0.08, 0.08),
@@ -137,18 +154,40 @@ function createWood(x, z, rotY = 0) {
   );
   mesh.position.set(x, -0.6, z);
   mesh.rotation.y = rotY;
-  scene.add(mesh);
-  woods.push(mesh);
+  return mesh;
 }
 
-createWood(-0.6, 0.3, 0.2);
-createWood(0.6, 0.2, -0.4);
-createWood(0.2, -0.6, 0.9);
+function startFireTask() {
+  resetAllTasks();
 
-let draggingWood = null;
+  state = GameState.FIRE;
+  fired = false;
+  stableTimeFire = 0;
+  draggingWood = null;
 
-// 固定拖拉平面（y = -0.6）
-const firePlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0.6);
+  fireCircle = createFireCircle();
+  scene.add(fireCircle);
+
+  woods = [
+    createWood(-0.6, 0.3, 0.2),
+    createWood(0.6, 0.2, -0.4),
+    createWood(0.2, -0.6, 0.9),
+  ];
+  woods.forEach((w) => scene.add(w));
+}
+
+function removeFireTaskObjects() {
+  if (fireCircle) scene.remove(fireCircle);
+  fireCircle = null;
+
+  for (const w of woods) scene.remove(w);
+  woods = [];
+
+  if (flame) scene.remove(flame);
+  flame = null;
+
+  draggingWood = null;
+}
 
 function pointOnFirePlane(event) {
   setPointer(event);
@@ -159,11 +198,9 @@ function pointOnFirePlane(event) {
   return hit ? p : null;
 }
 
-let fired = false;
-let stableTimeFire = 0;
-let flame = null;
-
 function allWoodsInside() {
+  if (!fireCircle) return false;
+
   return woods.every((w) => {
     const dx = w.position.x - fireCircle.position.x;
     const dz = w.position.z - fireCircle.position.z;
@@ -175,6 +212,7 @@ function igniteFire() {
   if (fired) return;
   fired = true;
 
+  // 變色 + 火焰
   fireCircle.material.color.set(0xff3300);
   fireCircle.material.opacity = 1;
 
@@ -185,16 +223,17 @@ function igniteFire() {
   flame.position.set(0, -0.35, 0);
   scene.add(flame);
 
-  setStatus("🔥 生火成功！進入狩獵任務…");
+  setStatus("🔥 生火成功！切換到狩獵任務…");
 
-  // 0.8 秒後切任務（讓玩家看一下成功）
+  // 0.8 秒後切任務（給玩家看到成功）
   setTimeout(() => {
-    startHuntTask();
+    removeFireTaskObjects(); // ✅ 生火完成：木柴+營火全部消失
+    startHuntTask(); // ✅ 進入狩獵
   }, 800);
 }
 
 function updateFire(dt) {
-  if (fired) return;
+  if (!fireCircle || fired) return;
 
   const inside = allWoodsInside();
   if (inside) stableTimeFire += dt;
@@ -204,7 +243,7 @@ function updateFire(dt) {
   const pct = Math.round(progress * 100);
 
   if (inside) setStatus(`穩定中：${pct}%（生火）`);
-  else setStatus("拖拉木頭進圈內並保持穩定");
+  else setStatus("拖拉木柴進圈內並保持穩定");
 
   fireCircle.material.opacity = 0.4 + 0.6 * progress;
 
@@ -213,15 +252,8 @@ function updateFire(dt) {
 
 // ============================================================
 // 2) HUNT TASK (tap to shoot targets)
+//    - 使用中文命名（野獸類型/提示文案）
 // ============================================================
-/**
- * 簡化狩獵 demo：
- * - 野獸在前方區域（x: [-1,1], y: [-0.2,0.7], z: -2.2）隨機竄出
- * - 玩家用點擊（pointerdown）射擊
- * - 指定目標：adult（大隻）= 加分
- * - 禁止目標：juvenile（幼獸）或 decoy（非指定）= 扣分
- * - 達到 targetScore 結束
- */
 
 // 狩獵區域（世界座標）
 const HUNT_Z = -2.2;
@@ -229,19 +261,17 @@ const HUNT_X_RANGE = 1.2;
 const HUNT_Y_MIN = -0.15;
 const HUNT_Y_MAX = 0.75;
 
-// 分數設定
 let score = 0;
 const targetScore = 5;
 
-// 生成節奏
+// 生怪節奏
 let spawnCooldown = 0;
 
-// 目標容器
-const huntTargets = []; // { mesh, kind, ttl, speed, dir }
+// 目標：{ mesh, 類型, ttl, speed, dir }
+const huntTargets = [];
 let crosshair = null;
 
 function makeCrosshair() {
-  // 很簡單的準星（線框環）
   const m = new THREE.Mesh(
     new THREE.RingGeometry(0.035, 0.045, 24),
     new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 })
@@ -250,14 +280,12 @@ function makeCrosshair() {
   return m;
 }
 
-function createTargetMesh(kind) {
-  // 用顏色區分（你之後可換成真正動物模型/貼圖）
-  // adult: 深色；juvenile: 淺色；decoy: 偏紅
+function createTargetMesh(類型) {
+  // 顏色 + 尺寸（之後可換模型）
   const color =
-    kind === "adult" ? 0x2e2e2e : kind === "juvenile" ? 0xbdbdbd : 0xaa3333;
+    類型 === "指定野獸" ? 0x2e2e2e : 類型 === "幼獸" ? 0xbdbdbd : 0xaa3333;
 
-  const size =
-    kind === "adult" ? 0.18 : kind === "juvenile" ? 0.12 : 0.16;
+  const size = 類型 === "指定野獸" ? 0.18 : 類型 === "幼獸" ? 0.12 : 0.16;
 
   const mesh = new THREE.Mesh(
     new THREE.SphereGeometry(size, 16, 12),
@@ -268,26 +296,24 @@ function createTargetMesh(kind) {
 }
 
 function spawnTarget() {
-  // 出現機率：adult 55%、juvenile 25%、decoy 20%
+  // 出現機率：指定野獸 55%、幼獸 25%、非指定動物 20%
   const r = Math.random();
-  const kind = r < 0.55 ? "adult" : r < 0.8 ? "juvenile" : "decoy";
+  const 類型 = r < 0.55 ? "指定野獸" : r < 0.8 ? "幼獸" : "非指定動物";
 
-  const mesh = createTargetMesh(kind);
+  const mesh = createTargetMesh(類型);
 
-  // 從左→右或右→左竄出
   const fromLeft = Math.random() < 0.5;
   const x0 = fromLeft ? -HUNT_X_RANGE : HUNT_X_RANGE;
   const y0 = HUNT_Y_MIN + Math.random() * (HUNT_Y_MAX - HUNT_Y_MIN);
 
   mesh.position.set(x0, y0, HUNT_Z);
 
-  // 速度/存活時間
-  const speed = kind === "adult" ? 0.9 : kind === "juvenile" ? 1.2 : 1.1;
-  const ttl = kind === "adult" ? 1.6 : kind === "juvenile" ? 1.4 : 1.5;
+  const speed = 類型 === "指定野獸" ? 0.9 : 類型 === "幼獸" ? 1.2 : 1.1;
+  const ttl = 類型 === "指定野獸" ? 1.6 : 類型 === "幼獸" ? 1.4 : 1.5;
   const dir = fromLeft ? 1 : -1;
 
   scene.add(mesh);
-  huntTargets.push({ mesh, kind, ttl, speed, dir });
+  huntTargets.push({ mesh, 類型, ttl, speed, dir });
 }
 
 function clearHunt() {
@@ -296,34 +322,31 @@ function clearHunt() {
 }
 
 function startHuntTask() {
-  // 切 state
   state = GameState.HUNT;
 
-  // 清掉生火互動（你也可保留火堆當背景）
-  draggingWood = null;
+  score = 0;
+  spawnCooldown = 0.4;
+  clearHunt();
 
-  // 顯示準星
   if (!crosshair) {
     crosshair = makeCrosshair();
     scene.add(crosshair);
   }
 
-  // 初始化分數/節奏
-  score = 0;
-  spawnCooldown = 0.4;
-  clearHunt();
-
-  setStatus("🎯 狩獵開始：只打「指定野獸」！別打幼獸或非指定目標");
+  setStatus("🎯 狩獵開始：只打「指定野獸」！別打「幼獸」或「非指定動物」");
 }
 
 function endHuntTask() {
   state = GameState.DONE;
+
   clearHunt();
+
   if (crosshair) {
     scene.remove(crosshair);
     crosshair = null;
   }
-  setStatus("✅ 狩獵完成！任務結束（Demo）");
+
+  setStatus("✅ 狩獵完成！Demo 結束");
 }
 
 function updateHunt(dt) {
@@ -331,11 +354,10 @@ function updateHunt(dt) {
   spawnCooldown -= dt;
   if (spawnCooldown <= 0) {
     spawnTarget();
-    // 節奏：0.35~0.8 秒
     spawnCooldown = 0.35 + Math.random() * 0.45;
   }
 
-  // 更新目標移動/消失
+  // 更新目標
   for (let i = huntTargets.length - 1; i >= 0; i--) {
     const t = huntTargets[i];
     t.ttl -= dt;
@@ -347,20 +369,17 @@ function updateHunt(dt) {
     }
   }
 
-  // 顯示分數
   setStatus(
-    `🎯 狩獵中：分數 ${score}/${targetScore}（打 adult +1；打 juvenile/decoy -1）`
+    `🎯 狩獵中：分數 ${score}/${targetScore}（打「指定野獸」+1；打「幼獸/非指定動物」-1）`
   );
 
   if (score >= targetScore) endHuntTask();
   if (score <= -3) {
-    // 你也可以改成「失敗」分支
-    setStatus("⚠️ 太多誤擊！請重新整理再試（Demo）");
+    setStatus("⚠️ 誤擊太多！Demo 結束（請重新整理再試）");
     state = GameState.DONE;
   }
 }
 
-// ---------------- Shooting (click to hit) ----------------
 function shoot(event) {
   if (state !== GameState.HUNT) return;
 
@@ -377,14 +396,13 @@ function shoot(event) {
 
   const t = huntTargets[idx];
 
-  // 計分規則
-  if (t.kind === "adult") score += 1;
+  // 計分（中文類型）
+  if (t.類型 === "指定野獸") score += 1;
   else score -= 1;
 
-  // 命中效果：快速縮放一下
+  // 命中效果
   hitMesh.scale.setScalar(0.6);
   setTimeout(() => {
-    // 移除目標
     scene.remove(hitMesh);
   }, 60);
 
@@ -392,7 +410,7 @@ function shoot(event) {
 }
 
 // ============================================================
-// Pointer events (two modes)
+// Pointer events
 // ============================================================
 function onPointerDown(event) {
   if (state === GameState.FIRE) {
@@ -430,6 +448,24 @@ canvas.addEventListener("pointerdown", onPointerDown);
 canvas.addEventListener("pointermove", onPointerMove);
 canvas.addEventListener("pointerup", onPointerUp);
 canvas.addEventListener("pointercancel", onPointerUp);
+
+// ---------------- Reset ----------------
+function resetAllTasks() {
+  // fire objects
+  removeFireTaskObjects();
+
+  // hunt objects
+  clearHunt();
+  if (crosshair) {
+    scene.remove(crosshair);
+    crosshair = null;
+  }
+
+  state = GameState.IDLE;
+  fired = false;
+  stableTimeFire = 0;
+  score = 0;
+}
 
 // ---------------- Loop ----------------
 let lastT = performance.now();
