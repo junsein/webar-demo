@@ -1,7 +1,7 @@
 import "./style.css";
 import * as THREE from "three";
 
-// ---------- DOM ----------
+// ---------------- DOM ----------------
 const video = document.getElementById("video");
 const canvas = document.getElementById("three");
 const btnStart = document.getElementById("btnStart");
@@ -10,12 +10,11 @@ const btnPlace = document.getElementById("btnPlace");
 const statusEl = document.getElementById("status");
 
 let stream = null;
-
 function setStatus(msg) {
   statusEl.textContent = msg;
 }
 
-// ---------- Device Camera ----------
+// ---------------- Device camera ----------------
 async function startCamera() {
   if (stream) return;
 
@@ -35,14 +34,10 @@ async function startCamera() {
     btnStart.disabled = true;
     btnStop.disabled = false;
 
-    // Reset placement/game state
-    resetGame();
-    enableFloorDetection();
-    scanGrid = createScanGrid();
-    scene.add(scanGrid);
-    setStatus("請對準地面並緩慢移動以偵測平面…");
-    if (scanGrid) scene.remove(scanGrid);
-    scanGrid = null;
+    resetAll();
+    setStatus("相機已啟動。按「準備放置」以啟用地面偵測（iPhone 需要授權）");
+    // 不在這裡 requestPermission（iOS 會擋），改在 btnPlace 的 click（手勢）做
+    ensureScanGrid();
   } catch (err) {
     console.error(err);
     stream = null;
@@ -63,7 +58,7 @@ function stopCamera() {
   btnStart.disabled = false;
   btnStop.disabled = true;
 
-  resetGame();
+  resetAll();
   setStatus("相機已關閉");
 }
 
@@ -75,7 +70,7 @@ if (!navigator.mediaDevices?.getUserMedia) {
   btnStart.disabled = true;
 }
 
-// ---------- Three.js ----------
+// ---------------- Three.js ----------------
 const renderer = new THREE.WebGLRenderer({
   canvas,
   alpha: true,
@@ -100,31 +95,37 @@ function resize() {
 window.addEventListener("resize", resize);
 resize();
 
-// ---------- "Ground" setup (fake AR plane) ----------
-const groundY = -0.6; // 我們的「地面」高度（世界座標）
+// ---------------- "Fake AR plane" model ----------------
+// 我們用一個固定高度的地面平面 (y = groundY) 模擬「地面」。
+// 掃描網格會跟著相機視線中心打到的地面交點移動，永遠在視野前方。
+const groundY = -0.6;
 const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -groundY);
 
-// ---------- Game Objects (created on placement) ----------
+// 放置限制：避免點太遠讓物件出畫
+const MAX_PLACE_RADIUS = 1.2;
+
+// ---------------- Game objects ----------------
 const fireRadius = 0.6;
 const STABLE_SECONDS = 2.5;
 
+let scanGrid = null;
 let fireCircle = null;
 let woods = [];
 let flame = null;
-let scanGrid = null;
-const MAX_PLACE_RADIUS = 1.2; // 限制放置距離：避免點太遠看不到
 
-let anchor = new THREE.Vector3(0, groundY, 0); // 放置點（火堆中心）
+// anchor = 火堆中心（放置點）
+const anchor = new THREE.Vector3(0, groundY, 0);
 
-// ---------- Interaction / State ----------
+// ---------------- State ----------------
 canvas.style.pointerEvents = "auto";
 
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 
-let floorReady = false;     // "地面已偵測到"
-let placingMode = false;    // 正在等待玩家點一下放置
-let gameStarted = false;    // 物件已生成，可開始拖拉/判定
+let motionListening = false;
+let floorReady = false; // 用「傾角>55°」當作地面就緒信號
+let placingMode = false;
+let gameStarted = false;
 let fired = false;
 
 let dragging = null;
@@ -132,18 +133,12 @@ let dragging = null;
 let stableTime = 0;
 let lastT = performance.now();
 
-function resetGame() {
-  // 移除舊物件
-  if (fireCircle) scene.remove(fireCircle);
-  for (const w of woods) scene.remove(w);
-  if (flame) scene.remove(flame);
+// ---------------- Utilities ----------------
+function resetAll() {
+  removeGameObjects();
+  removeScanGrid();
 
-  fireCircle = null;
-  woods = [];
-  flame = null;
-
-  anchor.set(0, groundY, 0);
-
+  motionListening = false;
   floorReady = false;
   placingMode = false;
   gameStarted = false;
@@ -154,52 +149,96 @@ function resetGame() {
   stableTime = 0;
   lastT = performance.now();
 
-  btnPlace.disabled = true;
+  btnPlace.disabled = false; // 允許按，以便觸發 iOS motion 授權
   btnPlace.textContent = "準備放置";
 }
 
-// ---------- Floor detection (tilt-based, works without WebXR) ----------
-function enableFloorDetection() {
-  floorReady = false;
-  btnPlace.disabled = true;
-  btnPlace.textContent = "準備放置";
+function removeGameObjects() {
+  if (fireCircle) scene.remove(fireCircle);
+  for (const w of woods) scene.remove(w);
+  if (flame) scene.remove(flame);
 
-  const requestIOSPermission = async () => {
-    if (
-      typeof DeviceOrientationEvent !== "undefined" &&
-      typeof DeviceOrientationEvent.requestPermission === "function"
-    ) {
-      const res = await DeviceOrientationEvent.requestPermission();
-      if (res !== "granted") throw new Error("DeviceOrientation permission denied");
-    }
-  };
+  fireCircle = null;
+  woods = [];
+  flame = null;
 
-  const onOrientation = (e) => {
-    // beta: 前後傾角（度）
+  anchor.set(0, groundY, 0);
+}
+
+function removeScanGrid() {
+  if (scanGrid) scene.remove(scanGrid);
+  scanGrid = null;
+}
+
+function ensureScanGrid() {
+  if (scanGrid) return;
+  scanGrid = createScanGrid();
+  scene.add(scanGrid);
+}
+
+// iOS：必須在「使用者手勢」(click/tap) 內呼叫才會跳授權
+async function requestMotionPermissionIfNeeded() {
+  if (
+    typeof DeviceOrientationEvent !== "undefined" &&
+    typeof DeviceOrientationEvent.requestPermission === "function"
+  ) {
+    const res = await DeviceOrientationEvent.requestPermission();
+    if (res !== "granted") throw new Error("Motion permission not granted");
+  }
+}
+
+// ---------------- Scan grid ----------------
+function createScanGrid() {
+  const grid = new THREE.GridHelper(4, 20, 0x00ffaa, 0x00ffaa);
+  grid.material.transparent = true;
+  grid.material.opacity = 0.25;
+  grid.position.set(anchor.x, groundY, anchor.z);
+  return grid;
+}
+
+function updateScanGrid() {
+  if (!scanGrid || gameStarted) return;
+
+  // 相機中心射線 (0,0) 打地面，網格永遠在視野前方
+  raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+  const p = new THREE.Vector3();
+  const hit = raycaster.ray.intersectPlane(groundPlane, p);
+
+  if (hit) {
+    scanGrid.position.set(p.x, groundY, p.z);
+    anchor.set(p.x, groundY, p.z);
+
+    // 視覺：地面就緒更亮
+    scanGrid.material.opacity = floorReady ? 0.5 : 0.2;
+  } else {
+    scanGrid.material.opacity = 0.1;
+  }
+}
+
+// ---------------- "Floor detection" via tilt ----------------
+// 注意：這不是 ARKit 平面偵測，而是用傾角做「地面就緒」提示。
+// 真正 hit-test 要 WebXR/原生；但此法 Demo 最穩、相容性最高。
+let orientationHandler = null;
+
+function startMotionListening() {
+  if (motionListening) return;
+
+  orientationHandler = (e) => {
     const beta = e.beta;
     if (typeof beta !== "number") return;
 
-    // 當手機朝向地面（大概 55~90 度）視為「地面就緒」
+    // beta > 55 代表手機大致朝下看地面
     if (!floorReady && beta > 55) {
       floorReady = true;
-      btnPlace.disabled = false;
-      setStatus("已偵測到地面 ✅ 按「準備放置」後，點一下地面放置火堆");
+      setStatus("已偵測到地面 ✅ 請在掃描網格附近點一下放置火堆");
     }
   };
 
-  requestIOSPermission()
-    .then(() => {
-      window.addEventListener("deviceorientation", onOrientation, true);
-    })
-    .catch(() => {
-      // 沒有 orientation 權限或不支援：退而求其次，允許直接放置
-      floorReady = true;
-      btnPlace.disabled = false;
-      setStatus("裝置未提供地面偵測；仍可按「準備放置」並點一下地面放置火堆");
-    });
+  window.addEventListener("deviceorientation", orientationHandler, true);
+  motionListening = true;
 }
 
-// ---------- Create objects on placement ----------
+// ---------------- Create game objects ----------------
 function createFireCircle() {
   const mesh = new THREE.Mesh(
     new THREE.RingGeometry(fireRadius - 0.02, fireRadius, 32),
@@ -214,23 +253,12 @@ function createFireCircle() {
   return mesh;
 }
 
-function createScanGrid() {
-  // 一個地面網格，半透明，讓玩家知道「地面在哪」
-  const grid = new THREE.GridHelper(4, 20, 0x00ffaa, 0x00ffaa);
-  grid.material.transparent = true;
-  grid.material.opacity = 0.35;
-  grid.position.set(0, groundY, 0);
-
-  // GridHelper 預設是 XZ 平面，本來就符合地面，不用旋轉
-  return grid;
-}
-
 function createWood(localX, localZ, rotY = 0) {
   const mesh = new THREE.Mesh(
     new THREE.BoxGeometry(0.25, 0.08, 0.08),
     new THREE.MeshStandardMaterial({ color: 0x8b5a2b })
   );
-  mesh.position.set(anchor.x + localX, anchor.y, anchor.z + localZ);
+  mesh.position.set(anchor.x + localX, groundY, anchor.z + localZ);
   mesh.rotation.y = rotY;
   return mesh;
 }
@@ -248,31 +276,53 @@ function startGameAt(pointOnGround) {
   ];
 
   scene.add(fireCircle);
-  if (scanGrid) {
-    scene.remove(scanGrid);
-    scanGrid = null;
-  }
   woods.forEach((w) => scene.add(w));
+
+  // 放置後移除掃描網格，畫面乾淨
+  removeScanGrid();
 
   gameStarted = true;
   placingMode = false;
-  btnPlace.disabled = true;
-  btnPlace.textContent = "已放置";
+  fired = false;
 
   stableTime = 0;
+  btnPlace.disabled = true;
+  btnPlace.textContent = "已放置";
   setStatus("把木頭拖進圈內並保持穩定");
 }
 
-// ---------- Placement button ----------
-btnPlace.addEventListener("click", () => {
-  if (!floorReady) return;
+// ---------------- Place button ----------------
+btnPlace.addEventListener("click", async () => {
+  // 沒開相機就不做
+  if (!stream) {
+    setStatus("請先開啟相機");
+    return;
+  }
 
+  // 1) 先確保有掃描網格
+  ensureScanGrid();
+
+  // 2) 第一次按：在 iOS 這裡做 motion 授權（手勢觸發）
+  if (!motionListening) {
+    try {
+      await requestMotionPermissionIfNeeded();
+      startMotionListening();
+      setStatus("請對準地面並緩慢移動以偵測平面…");
+    } catch (e) {
+      // 沒授權或不支援：仍可放置，但 floorReady 可能不會變 true
+      setStatus("未取得動作/方向授權；仍可按「準備放置」並點一下地面放置火堆");
+      // 仍開始 listening（有些環境不需要 requestPermission）
+      startMotionListening();
+    }
+  }
+
+  // 3) 進入放置模式（點一下地面）
   placingMode = true;
   btnPlace.textContent = "點一下地面…";
-  setStatus("請在畫面上點一下你要放火堆的位置（地面）");
+  setStatus("請在掃描網格附近點一下地面放置火堆");
 });
 
-// ---------- Drag / Place Controls ----------
+// ---------------- Pointer interaction ----------------
 function setPointer(event) {
   pointer.x = (event.clientX / window.innerWidth) * 2 - 1;
   pointer.y = -(event.clientY / window.innerHeight) * 2 + 1;
@@ -288,38 +338,36 @@ function getPointOnGround(event) {
 }
 
 function onPointerDown(event) {
-  // 1) 放置模式：點一下地面放置火堆
+  // 放置模式：點一下放置火堆（限制在掃描網格附近）
   if (placingMode && !gameStarted) {
     const p = getPointOnGround(event);
-
-    // 沒打到地面就不放
     if (!p) return;
 
-    // 距離限制：避免放到很遠看不到
-    const dx = p.x - scanGrid.position.x;
-    const dz = p.z - scanGrid.position.z;
-    const dist = Math.sqrt(dx * dx + dz * dz);
-
-    if (dist > MAX_PLACE_RADIUS) {
-      setStatus("太遠了！請在掃描網格附近點一下放置");
-      return;
+    // 若有 scanGrid：限制點擊距離，避免放到很遠看不到
+    if (scanGrid) {
+      const dx = p.x - scanGrid.position.x;
+      const dz = p.z - scanGrid.position.z;
+      const dist = Math.sqrt(dx * dx + dz * dz);
+      if (dist > MAX_PLACE_RADIUS) {
+        setStatus("太遠了！請在掃描網格附近點一下放置");
+        return;
+      }
     }
 
+    // 即使 floorReady 尚未 true，也允許放置（避免 iOS 授權失敗卡死）
     startGameAt(p);
     return;
   }
 
-  // 2) 遊戲未開始，不能拖
+  // 遊戲未開始或已點燃：不可拖
   if (!gameStarted || fired) return;
 
-  // 3) 拖拉木頭
+  // 拖拉木頭
   setPointer(event);
   raycaster.setFromCamera(pointer, camera);
 
   const hits = raycaster.intersectObjects(woods);
-  if (hits.length > 0) {
-    dragging = hits[0].object;
-  }
+  if (hits.length > 0) dragging = hits[0].object;
 }
 
 function onPointerMove(event) {
@@ -328,9 +376,7 @@ function onPointerMove(event) {
   const p = getPointOnGround(event);
   if (!p) return;
 
-  dragging.position.x = p.x;
-  dragging.position.z = p.z;
-  dragging.position.y = groundY;
+  dragging.position.set(p.x, groundY, p.z);
 }
 
 function onPointerUp() {
@@ -342,7 +388,7 @@ canvas.addEventListener("pointermove", onPointerMove);
 canvas.addEventListener("pointerup", onPointerUp);
 canvas.addEventListener("pointercancel", onPointerUp);
 
-// ---------- Stability Check ----------
+// ---------------- Stability logic ----------------
 function allWoodsInside() {
   if (!fireCircle) return false;
 
@@ -377,7 +423,6 @@ function updateStability(dt) {
   if (!gameStarted || fired) return;
 
   const inside = allWoodsInside();
-
   if (inside) stableTime += dt;
   else stableTime = 0;
 
@@ -387,13 +432,12 @@ function updateStability(dt) {
   if (inside) setStatus(`穩定中：${pct}%`);
   else setStatus("把木頭拖進圈內並保持穩定");
 
-  // 視覺回饋：進度越高圈越亮
   fireCircle.material.opacity = 0.4 + 0.6 * progress;
 
   if (stableTime >= STABLE_SECONDS) igniteFire();
 }
 
-// ---------- Render loop ----------
+// ---------------- Render loop ----------------
 function animate() {
   requestAnimationFrame(animate);
 
@@ -403,30 +447,7 @@ function animate() {
 
   updateScanGrid();
   updateStability(dt);
+
   renderer.render(scene, camera);
 }
-
-function updateScanGrid() {
-  if (!scanGrid || gameStarted) return;
-
-  // 用相機中心射線 (0,0) 去打地面
-  raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
-
-  const p = new THREE.Vector3();
-  const hit = raycaster.ray.intersectPlane(groundPlane, p);
-
-  if (hit) {
-    // 永遠放在視線前方的地面
-    scanGrid.position.set(p.x, groundY, p.z);
-    anchor.set(p.x, groundY, p.z);
-
-    // 視覺提示：地面就緒 vs 正在找地面
-    scanGrid.material.opacity = floorReady ? 0.5 : 0.2;
-  } else {
-    // 如果沒打到地面（例如鏡頭朝天），就淡出
-    scanGrid.material.opacity = 0.1;
-  }
-}
 animate();
-
-
