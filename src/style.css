@@ -31,7 +31,7 @@ html, body {
   width: 100vw;
   height: 100vh;
   z-index: 1;
-  pointer-events: none; /* 先讓點擊穿透；之後要互動再拿掉 */
+  pointer-events: auto;
 }
 
 /* HUD 在最上 */
