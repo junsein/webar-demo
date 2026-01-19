@@ -38,7 +38,11 @@ async function startCamera() {
     // Reset placement/game state
     resetGame();
     enableFloorDetection();
+    scanGrid = createScanGrid();
+    scene.add(scanGrid);
     setStatus("請對準地面並緩慢移動以偵測平面…");
+    if (scanGrid) scene.remove(scanGrid);
+    scanGrid = null;
   } catch (err) {
     console.error(err);
     stream = null;
@@ -107,6 +111,8 @@ const STABLE_SECONDS = 2.5;
 let fireCircle = null;
 let woods = [];
 let flame = null;
+let scanGrid = null;
+const MAX_PLACE_RADIUS = 1.2; // 限制放置距離：避免點太遠看不到
 
 let anchor = new THREE.Vector3(0, groundY, 0); // 放置點（火堆中心）
 
@@ -208,6 +214,17 @@ function createFireCircle() {
   return mesh;
 }
 
+function createScanGrid() {
+  // 一個地面網格，半透明，讓玩家知道「地面在哪」
+  const grid = new THREE.GridHelper(4, 20, 0x00ffaa, 0x00ffaa);
+  grid.material.transparent = true;
+  grid.material.opacity = 0.35;
+  grid.position.set(0, groundY, 0);
+
+  // GridHelper 預設是 XZ 平面，本來就符合地面，不用旋轉
+  return grid;
+}
+
 function createWood(localX, localZ, rotY = 0) {
   const mesh = new THREE.Mesh(
     new THREE.BoxGeometry(0.25, 0.08, 0.08),
@@ -231,6 +248,10 @@ function startGameAt(pointOnGround) {
   ];
 
   scene.add(fireCircle);
+  if (scanGrid) {
+    scene.remove(scanGrid);
+    scanGrid = null;
+  }
   woods.forEach((w) => scene.add(w));
 
   gameStarted = true;
@@ -270,7 +291,21 @@ function onPointerDown(event) {
   // 1) 放置模式：點一下地面放置火堆
   if (placingMode && !gameStarted) {
     const p = getPointOnGround(event);
-    if (p) startGameAt(p);
+
+    // 沒打到地面就不放
+    if (!p) return;
+
+    // 距離限制：避免放到很遠看不到
+    const dx = p.x - scanGrid.position.x;
+    const dz = p.z - scanGrid.position.z;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+
+    if (dist > MAX_PLACE_RADIUS) {
+      setStatus("太遠了！請在掃描網格附近點一下放置");
+      return;
+    }
+
+    startGameAt(p);
     return;
   }
 
@@ -366,7 +401,32 @@ function animate() {
   const dt = (now - lastT) / 1000;
   lastT = now;
 
+  updateScanGrid();
   updateStability(dt);
   renderer.render(scene, camera);
 }
+
+function updateScanGrid() {
+  if (!scanGrid || gameStarted) return;
+
+  // 用相機中心射線 (0,0) 去打地面
+  raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+
+  const p = new THREE.Vector3();
+  const hit = raycaster.ray.intersectPlane(groundPlane, p);
+
+  if (hit) {
+    // 永遠放在視線前方的地面
+    scanGrid.position.set(p.x, groundY, p.z);
+    anchor.set(p.x, groundY, p.z);
+
+    // 視覺提示：地面就緒 vs 正在找地面
+    scanGrid.material.opacity = floorReady ? 0.5 : 0.2;
+  } else {
+    // 如果沒打到地面（例如鏡頭朝天），就淡出
+    scanGrid.material.opacity = 0.1;
+  }
+}
 animate();
+
+
