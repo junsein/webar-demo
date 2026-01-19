@@ -3,19 +3,20 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover" />
-    <title>WebAR Camera Demo</title>
+    <title>Camera + Three Overlay</title>
   </head>
   <body>
     <div id="app">
-      <div class="topbar">
+      <video id="video" playsinline muted></video>
+      <canvas id="three"></canvas>
+
+      <div class="hud">
         <button id="btnStart">開啟相機</button>
         <button id="btnStop" disabled>關閉相機</button>
         <span id="status">尚未啟動</span>
       </div>
-
-      <video id="video" playsinline muted></video>
     </div>
 
-    <script type="module" src="/src/main.js"></script>
+    <script type="module" src="/main.js"></script>
   </body>
 </html>

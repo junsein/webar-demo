@@ -3,25 +3,52 @@ html, body {
   padding: 0;
   height: 100%;
   background: #000;
-  color: #fff;
+  overflow: hidden;
+  touch-action: none; /* 避免拖曳時瀏覽器手勢干擾 */
   font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
 }
 
 #app {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
+  position: fixed;
+  inset: 0;
 }
 
-.topbar {
+/* 相機底層 */
+#video {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  object-fit: cover;
+  background: #000;
+  z-index: 0;
+}
+
+/* Three.js 疊在上層 */
+#three {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 1;
+  pointer-events: none; /* 先讓點擊穿透；之後要互動再拿掉 */
+}
+
+/* HUD 在最上 */
+.hud {
+  position: fixed;
+  left: 12px;
+  right: 12px;
+  top: 12px;
+  z-index: 2;
   display: flex;
   gap: 10px;
   align-items: center;
-  padding: 10px;
-  background: rgba(0,0,0,0.65);
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(0,0,0,0.55);
+  color: #fff;
 }
-
-#status { opacity: 0.9; }
 
 button {
   padding: 10px 12px;
@@ -30,12 +57,5 @@ button {
   background: #2b2b2b;
   color: #fff;
 }
-
 button:disabled { opacity: 0.5; }
-
-video {
-  flex: 1;
-  width: 100%;
-  height: 100%;
-  object-fit: cover; /* 填滿畫面 */
-}
+#status { opacity: 0.9; }
