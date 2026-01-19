@@ -35,9 +35,8 @@ async function startCamera() {
     btnStop.disabled = false;
 
     resetAll();
-    setStatus("相機已啟動。按「準備放置」以啟用地面偵測（iPhone 需要授權）");
-    // 不在這裡 requestPermission（iOS 會擋），改在 btnPlace 的 click（手勢）做
     ensureScanGrid();
+    setStatus("相機已啟動。按「準備放置」以啟用地面偵測（iPhone 需要授權）");
   } catch (err) {
     console.error(err);
     stream = null;
@@ -80,6 +79,7 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 
 const scene = new THREE.Scene();
 
+// Three 的相機（後面會接手機陀螺儀旋轉）
 const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 100);
 camera.position.set(0, 0, 2);
 
@@ -96,12 +96,17 @@ window.addEventListener("resize", resize);
 resize();
 
 // ---------------- "Fake AR plane" model ----------------
-// 我們用一個固定高度的地面平面 (y = groundY) 模擬「地面」。
-// 掃描網格會跟著相機視線中心打到的地面交點移動，永遠在視野前方。
+/**
+ * 這是一個「不用 WebXR」的穩定 Demo 作法：
+ * - 用固定高度平面 y=groundY 當作地面
+ * - 掃描網格永遠跟著「相機中心射線」打到地面的交點，讓玩家永遠看得到
+ * - 放置後移除網格 & 鎖定 anchor
+ * - 再用 deviceorientation 去轉動 three camera（3DOF），提升「物件固定在世界」的感覺
+ */
 const groundY = -0.6;
 const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -groundY);
 
-// 放置限制：避免點太遠讓物件出畫
+// 放置限制：避免點太遠導致物件出畫
 const MAX_PLACE_RADIUS = 1.2;
 
 // ---------------- Game objects ----------------
@@ -123,7 +128,7 @@ const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 
 let motionListening = false;
-let floorReady = false; // 用「傾角>55°」當作地面就緒信號
+let floorReady = false; // 用「傾角 beta > 55°」當作地面就緒信號
 let placingMode = false;
 let gameStarted = false;
 let fired = false;
@@ -133,24 +138,40 @@ let dragging = null;
 let stableTime = 0;
 let lastT = performance.now();
 
-// ---------------- Utilities ----------------
+// --- Camera gyro control (3DOF) ---
+let camControlEnabled = false;
+let baseYaw = 0; // 校正初始 yaw，避免一開始方向亂飄
+
+// ---------------- Reset / cleanup ----------------
 function resetAll() {
   removeGameObjects();
   removeScanGrid();
 
+  // motion
   motionListening = false;
   floorReady = false;
+
+  // modes
   placingMode = false;
   gameStarted = false;
   fired = false;
 
+  // drag + timer
   dragging = null;
-
   stableTime = 0;
   lastT = performance.now();
 
+  // camera control
+  camControlEnabled = false;
+  baseYaw = 0;
+
+  // UI
   btnPlace.disabled = false; // 允許按，以便觸發 iOS motion 授權
   btnPlace.textContent = "準備放置";
+
+  // 將相機姿態回到預設（避免上一局殘留）
+  camera.quaternion.identity();
+  camera.position.set(0, 0, 2);
 }
 
 function removeGameObjects() {
@@ -170,13 +191,7 @@ function removeScanGrid() {
   scanGrid = null;
 }
 
-function ensureScanGrid() {
-  if (scanGrid) return;
-  scanGrid = createScanGrid();
-  scene.add(scanGrid);
-}
-
-// iOS：必須在「使用者手勢」(click/tap) 內呼叫才會跳授權
+// ---------------- iOS motion permission ----------------
 async function requestMotionPermissionIfNeeded() {
   if (
     typeof DeviceOrientationEvent !== "undefined" &&
@@ -196,41 +211,81 @@ function createScanGrid() {
   return grid;
 }
 
+function ensureScanGrid() {
+  if (scanGrid) return;
+  scanGrid = createScanGrid();
+  scene.add(scanGrid);
+}
+
+/**
+ * 每一幀用相機中心射線（0,0）打地面
+ * - scanGrid 跟著交點走，永遠在可視位置（不會跑很遠）
+ * - 只有在「尚未放置」時更新；放置後 gameStarted=true 就停止
+ */
 function updateScanGrid() {
   if (!scanGrid || gameStarted) return;
 
-  // 相機中心射線 (0,0) 打地面，網格永遠在視野前方
   raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
   const p = new THREE.Vector3();
   const hit = raycaster.ray.intersectPlane(groundPlane, p);
 
   if (hit) {
     scanGrid.position.set(p.x, groundY, p.z);
+    // placing 前，anchor 只是「建議放置點」；真正放置後會鎖定
     anchor.set(p.x, groundY, p.z);
 
-    // 視覺：地面就緒更亮
-    scanGrid.material.opacity = floorReady ? 0.5 : 0.2;
+    scanGrid.material.opacity = floorReady ? 0.55 : 0.2;
   } else {
     scanGrid.material.opacity = 0.1;
   }
 }
 
-// ---------------- "Floor detection" via tilt ----------------
-// 注意：這不是 ARKit 平面偵測，而是用傾角做「地面就緒」提示。
-// 真正 hit-test 要 WebXR/原生；但此法 Demo 最穩、相容性最高。
+// ---------------- DeviceOrientation -> Three camera (3DOF) ----------------
+function applyDeviceOrientationToCamera(e) {
+  const alpha = e.alpha ?? 0; // yaw-ish
+  const beta = e.beta ?? 0; // pitch
+  const gamma = e.gamma ?? 0; // roll
+
+  const deg2rad = Math.PI / 180;
+  const a = (alpha - baseYaw) * deg2rad;
+  const b = beta * deg2rad;
+  const g = gamma * deg2rad;
+
+  // 常見轉換：deviceorientation (ZXY) -> quaternion
+  const zee = new THREE.Vector3(0, 0, 1);
+  const euler = new THREE.Euler();
+  const q0 = new THREE.Quaternion();
+  const q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5)); // -PI/2 around X
+
+  euler.set(b, a, -g, "ZXY");
+  camera.quaternion.setFromEuler(euler);
+  camera.quaternion.multiply(q1);
+
+  // 螢幕方向補償
+  const orient = (screen.orientation?.angle ?? window.orientation ?? 0) * deg2rad;
+  q0.setFromAxisAngle(zee, -orient);
+  camera.quaternion.multiply(q0);
+}
+
+// ---------------- "Floor readiness" via tilt + camera control ----------------
 let orientationHandler = null;
 
 function startMotionListening() {
   if (motionListening) return;
 
   orientationHandler = (e) => {
+    // 1) 用 beta 做「地面就緒」提示
     const beta = e.beta;
-    if (typeof beta !== "number") return;
+    if (typeof beta === "number") {
+      if (!floorReady && beta > 55) {
+        floorReady = true;
+        setStatus("已偵測到地面 ✅ 請在掃描網格附近點一下放置火堆");
+      }
+    }
 
-    // beta > 55 代表手機大致朝下看地面
-    if (!floorReady && beta > 55) {
-      floorReady = true;
-      setStatus("已偵測到地面 ✅ 請在掃描網格附近點一下放置火堆");
+    // 2) 套用旋轉到 three camera，讓物件更像固定在世界（3DOF）
+    if (camControlEnabled) {
+      applyDeviceOrientationToCamera(e);
     }
   };
 
@@ -266,6 +321,7 @@ function createWood(localX, localZ, rotY = 0) {
 function startGameAt(pointOnGround) {
   if (gameStarted) return;
 
+  // 重要：放置後鎖定 anchor（不再被 updateScanGrid 改動）
   anchor.set(pointOnGround.x, groundY, pointOnGround.z);
 
   fireCircle = createFireCircle();
@@ -286,6 +342,7 @@ function startGameAt(pointOnGround) {
   fired = false;
 
   stableTime = 0;
+
   btnPlace.disabled = true;
   btnPlace.textContent = "已放置";
   setStatus("把木頭拖進圈內並保持穩定");
@@ -293,30 +350,34 @@ function startGameAt(pointOnGround) {
 
 // ---------------- Place button ----------------
 btnPlace.addEventListener("click", async () => {
-  // 沒開相機就不做
   if (!stream) {
     setStatus("請先開啟相機");
     return;
   }
 
-  // 1) 先確保有掃描網格
   ensureScanGrid();
 
-  // 2) 第一次按：在 iOS 這裡做 motion 授權（手勢觸發）
+  // 第一次按：iOS motion 授權（必須手勢觸發），並啟用相機旋轉控制
   if (!motionListening) {
     try {
       await requestMotionPermissionIfNeeded();
       startMotionListening();
+      camControlEnabled = true;
+
+      // 校正 yaw：讓此刻朝向視為 0
+      baseYaw = 0; // 先清
       setStatus("請對準地面並緩慢移動以偵測平面…");
     } catch (e) {
-      // 沒授權或不支援：仍可放置，但 floorReady 可能不會變 true
-      setStatus("未取得動作/方向授權；仍可按「準備放置」並點一下地面放置火堆");
-      // 仍開始 listening（有些環境不需要 requestPermission）
+      // 沒授權也不阻止 Demo：仍可放置，但 floorReady 可能不會變 true
       startMotionListening();
+      camControlEnabled = true;
+      setStatus("未取得動作/方向授權；仍可點一下地面放置火堆（掃描網格仍會顯示）");
     }
+  } else {
+    // 已在 listening：確保相機控制開著
+    camControlEnabled = true;
   }
 
-  // 3) 進入放置模式（點一下地面）
   placingMode = true;
   btnPlace.textContent = "點一下地面…";
   setStatus("請在掃描網格附近點一下地面放置火堆");
@@ -338,12 +399,11 @@ function getPointOnGround(event) {
 }
 
 function onPointerDown(event) {
-  // 放置模式：點一下放置火堆（限制在掃描網格附近）
+  // 放置模式：點一下放置火堆（限制在掃描網格附近，避免太遠）
   if (placingMode && !gameStarted) {
     const p = getPointOnGround(event);
     if (!p) return;
 
-    // 若有 scanGrid：限制點擊距離，避免放到很遠看不到
     if (scanGrid) {
       const dx = p.x - scanGrid.position.x;
       const dz = p.z - scanGrid.position.z;
@@ -354,7 +414,7 @@ function onPointerDown(event) {
       }
     }
 
-    // 即使 floorReady 尚未 true，也允許放置（避免 iOS 授權失敗卡死）
+    // 即使 floorReady 尚未 true 也允許放置，避免 iOS 權限卡死
     startGameAt(p);
     return;
   }
@@ -445,7 +505,10 @@ function animate() {
   const dt = (now - lastT) / 1000;
   lastT = now;
 
+  // 放置前：掃描網格跟著視線中心更新
   updateScanGrid();
+
+  // 放置後：物件位置已鎖定，只有相機姿態會跟著手機旋轉 -> 看起來更像固定在世界
   updateStability(dt);
 
   renderer.render(scene, camera);
